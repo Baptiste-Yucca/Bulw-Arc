@@ -10,24 +10,31 @@ interface IOracle {
 contract BulwArc {
     enum ShieldStatus { CREATED, PENDING, MATCHED, EXERCISED, EXPIRED }
 
+    struct Fill {
+        address guardian;
+        uint256 amount;
+    }
+
     struct Shield {
-        address subscriber;        // worker who buys protection
-        uint256 strike;       // EUR/USD price in 1e8 (e.g. 92_000_000 = 0.92)
-        uint256 notional;     // amount covered in USDC (1e6)
-        uint256 premium;      // premium paid in USDC (1e6)
-        uint256 expiry;       // unix timestamp
+        address subscriber;
+        uint256 strike;       // EUR/USD price in 1e8
+        uint256 notional;     // total amount to cover in USDC (1e6)
+        uint256 premium;      // premium in USDC (1e6)
+        uint256 filled;       // total filled so far
+        uint256 expiry;
         ShieldStatus status;
-        address guardian; // address(0) until matched
     }
 
     IERC20 public immutable usdc;
     IOracle public immutable oracle;
 
     Shield[] public shields;
+    mapping(uint256 => Fill[]) public fills; // shieldId => fills
 
     event ShieldCreated(uint256 indexed shieldId, address indexed subscriber, uint256 strike, uint256 notional, uint256 premium, uint256 expiry);
     event ShieldFunded(uint256 indexed shieldId, address indexed funder);
-    event ShieldMatched(uint256 indexed shieldId, address indexed guardian);
+    event ShieldFilled(uint256 indexed shieldId, address indexed guardian, uint256 amount);
+    event ShieldMatched(uint256 indexed shieldId);
     event ShieldExercised(uint256 indexed shieldId, uint256 payoff);
     event ShieldExpired(uint256 indexed shieldId);
 
@@ -38,7 +45,6 @@ contract BulwArc {
 
     // ========== CREATE ==========
 
-    /// @notice Create a shield (status = CREATED, no funds yet)
     function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
@@ -51,15 +57,14 @@ contract BulwArc {
             strike: strike,
             notional: notional,
             premium: premium,
+            filled: 0,
             expiry: expiry,
-            status: ShieldStatus.CREATED,
-            guardian: address(0)
+            status: ShieldStatus.CREATED
         }));
 
         emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry);
     }
 
-    /// @notice Create a shield AND fund the premium in one tx
     function createAndFundShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
@@ -74,9 +79,9 @@ contract BulwArc {
             strike: strike,
             notional: notional,
             premium: premium,
+            filled: 0,
             expiry: expiry,
-            status: ShieldStatus.PENDING,
-            guardian: address(0)
+            status: ShieldStatus.PENDING
         }));
 
         emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry);
@@ -85,7 +90,6 @@ contract BulwArc {
 
     // ========== FUND ==========
 
-    /// @notice Fund the premium of a CREATED shield (subscriber or anyone on behalf)
     function fundShield(uint256 shieldId) external {
         Shield storage s = shields[shieldId];
         require(s.status == ShieldStatus.CREATED, "Not created");
@@ -97,41 +101,51 @@ contract BulwArc {
         emit ShieldFunded(shieldId, msg.sender);
     }
 
-    // ========== MATCH ==========
+    // ========== MATCH (partial fill) ==========
 
-    /// @notice Match a shield yourself as guardian
-    function matchShield(uint256 shieldId) external {
-        _matchShield(shieldId, msg.sender);
+    function matchShield(uint256 shieldId, uint256 amount) external {
+        _matchShield(shieldId, msg.sender, amount);
     }
 
-    /// @notice Match a shield on behalf of another address as guardian
-    function matchShieldFor(uint256 shieldId, address guardian) external {
+    function matchShieldFor(uint256 shieldId, address guardian, uint256 amount) external {
         require(guardian != address(0), "Invalid guardian");
-        _matchShield(shieldId, guardian);
+        _matchShield(shieldId, guardian, amount);
     }
 
-    function _matchShield(uint256 shieldId, address guardian) internal {
+    function _matchShield(uint256 shieldId, address guardian, uint256 amount) internal {
         Shield storage s = shields[shieldId];
         require(s.status == ShieldStatus.PENDING, "Not pending");
         require(block.timestamp < s.expiry, "Expired");
+        require(amount > 0, "Invalid amount");
 
-        usdc.transferFrom(msg.sender, address(this), s.notional);
+        uint256 remaining = s.notional - s.filled;
+        require(amount <= remaining, "Exceeds remaining");
 
-        s.status = ShieldStatus.MATCHED;
-        s.guardian = guardian;
+        usdc.transferFrom(msg.sender, address(this), amount);
 
-        // Transfer premium to guardian immediately
-        usdc.transfer(guardian, s.premium);
+        fills[shieldId].push(Fill({guardian: guardian, amount: amount}));
+        s.filled += amount;
 
-        emit ShieldMatched(shieldId, guardian);
+        // Distribute premium pro-rata to this guardian
+        uint256 premiumShare = s.premium * amount / s.notional;
+        if (premiumShare > 0) {
+            usdc.transfer(guardian, premiumShare);
+        }
+
+        emit ShieldFilled(shieldId, guardian, amount);
+
+        if (s.filled == s.notional) {
+            s.status = ShieldStatus.MATCHED;
+            emit ShieldMatched(shieldId);
+        }
     }
 
     // ========== EXERCISE ==========
 
-    /// @notice Worker exercises the shield if EUR/USD spot < strike
     function exercise(uint256 shieldId) external {
         Shield storage s = shields[shieldId];
-        require(s.status == ShieldStatus.MATCHED, "Not matched");
+        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.MATCHED, "Cannot exercise");
+        require(s.filled > 0, "No fills");
         require(msg.sender == s.subscriber, "Not subscriber");
         require(block.timestamp <= s.expiry, "Past expiry");
 
@@ -140,50 +154,61 @@ contract BulwArc {
         require(spot > 0, "Invalid oracle price");
         require(uint256(spot) < s.strike, "Not in the money");
 
-        // payoff = (strike - spot) * notional / 1e8
-        uint256 payoff = (s.strike - uint256(spot)) * s.notional / 1e8;
-        if (payoff > s.notional) payoff = s.notional; // cap at collateral
+        uint256 payoffPerUnit = s.strike - uint256(spot); // in 1e8
 
         s.status = ShieldStatus.EXERCISED;
 
-        // Pay worker
-        usdc.transfer(s.subscriber, payoff);
-        // Return remaining collateral to guardian
-        uint256 remaining = s.notional - payoff;
-        if (remaining > 0) {
-            usdc.transfer(s.guardian, remaining);
+        uint256 totalPayoff;
+        Fill[] storage f = fills[shieldId];
+        for (uint256 i = 0; i < f.length; i++) {
+            uint256 guardianPayoff = payoffPerUnit * f[i].amount / 1e8;
+            if (guardianPayoff > f[i].amount) guardianPayoff = f[i].amount;
+
+            totalPayoff += guardianPayoff;
+
+            // Return remaining collateral to guardian
+            uint256 guardianRemaining = f[i].amount - guardianPayoff;
+            if (guardianRemaining > 0) {
+                usdc.transfer(f[i].guardian, guardianRemaining);
+            }
         }
 
-        emit ShieldExercised(shieldId, payoff);
+        // Pay subscriber total payoff
+        if (totalPayoff > 0) {
+            usdc.transfer(s.subscriber, totalPayoff);
+        }
+
+        emit ShieldExercised(shieldId, totalPayoff);
     }
 
     // ========== EXPIRE ==========
 
-    /// @notice Reclaim collateral after expiry if shield was not exercised
     function expire(uint256 shieldId) external {
         Shield storage s = shields[shieldId];
-        require(s.status == ShieldStatus.MATCHED, "Not matched");
+        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.MATCHED, "Cannot expire");
         require(block.timestamp > s.expiry, "Not expired yet");
 
         s.status = ShieldStatus.EXPIRED;
 
-        // Return full collateral to guardian
-        usdc.transfer(s.guardian, s.notional);
+        // Return collateral to each guardian
+        Fill[] storage f = fills[shieldId];
+        for (uint256 i = 0; i < f.length; i++) {
+            usdc.transfer(f[i].guardian, f[i].amount);
+        }
 
         emit ShieldExpired(shieldId);
     }
 
     // ========== CANCEL ==========
 
-    /// @notice Cancel a shield that is not yet matched. Premium returned to subscriber.
     function cancel(uint256 shieldId) external {
         Shield storage s = shields[shieldId];
         require(s.status == ShieldStatus.CREATED || s.status == ShieldStatus.PENDING, "Cannot cancel");
+        require(s.filled == 0, "Already has fills");
 
         ShieldStatus prev = s.status;
         s.status = ShieldStatus.EXPIRED;
 
-        // If funded, return premium to subscriber
         if (prev == ShieldStatus.PENDING) {
             usdc.transfer(s.subscriber, s.premium);
         }
@@ -197,5 +222,13 @@ contract BulwArc {
 
     function getShieldCount() external view returns (uint256) {
         return shields.length;
+    }
+
+    function getFills(uint256 shieldId) external view returns (Fill[] memory) {
+        return fills[shieldId];
+    }
+
+    function getFillCount(uint256 shieldId) external view returns (uint256) {
+        return fills[shieldId].length;
     }
 }
