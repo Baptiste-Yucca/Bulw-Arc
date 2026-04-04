@@ -8,7 +8,7 @@ interface IOracle {
 }
 
 contract BulwArc {
-    enum ShieldStatus { CREATED, PENDING, MATCHED, EXERCISED, EXPIRED }
+    enum ShieldStatus { CREATED, PENDING, LOCKED, EXERCISED, EXPIRED }
 
     struct Fill {
         address guardian;
@@ -34,7 +34,7 @@ contract BulwArc {
     event ShieldCreated(uint256 indexed shieldId, address indexed subscriber, uint256 strike, uint256 notional, uint256 premium, uint256 expiry);
     event ShieldFunded(uint256 indexed shieldId, address indexed funder);
     event ShieldFilled(uint256 indexed shieldId, address indexed guardian, uint256 amount);
-    event ShieldMatched(uint256 indexed shieldId);
+    event ShieldLocked(uint256 indexed shieldId);
     event ShieldExercised(uint256 indexed shieldId, uint256 payoff);
     event ShieldExpired(uint256 indexed shieldId);
 
@@ -135,8 +135,8 @@ contract BulwArc {
         emit ShieldFilled(shieldId, guardian, amount);
 
         if (s.filled == s.notional) {
-            s.status = ShieldStatus.MATCHED;
-            emit ShieldMatched(shieldId);
+            s.status = ShieldStatus.LOCKED;
+            emit ShieldLocked(shieldId);
         }
     }
 
@@ -144,7 +144,7 @@ contract BulwArc {
 
     function exercise(uint256 shieldId) external {
         Shield storage s = shields[shieldId];
-        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.MATCHED, "Cannot exercise");
+        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.LOCKED, "Cannot exercise");
         require(s.filled > 0, "No fills");
         require(msg.sender == s.subscriber, "Not subscriber");
         require(block.timestamp <= s.expiry, "Past expiry");
@@ -185,7 +185,7 @@ contract BulwArc {
 
     function expire(uint256 shieldId) external {
         Shield storage s = shields[shieldId];
-        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.MATCHED, "Cannot expire");
+        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.LOCKED, "Cannot expire");
         require(block.timestamp > s.expiry, "Not expired yet");
 
         s.status = ShieldStatus.EXPIRED;

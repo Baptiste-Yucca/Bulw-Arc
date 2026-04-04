@@ -119,7 +119,7 @@ contract BulwArcTest is Test {
         vm.stopPrank();
 
         BulwArc.Shield memory s = bulwarc.getShield(0);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.MATCHED));
+        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.LOCKED));
         assertEq(s.filled, NOTIONAL);
         assertEq(bulwarc.getFillCount(0), 1);
         assertEq(usdc.balanceOf(guardianA), gBefore - NOTIONAL + PREMIUM);
@@ -150,7 +150,7 @@ contract BulwArcTest is Test {
         assertEq(s.filled, 700e6);
         assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.PENDING));
 
-        // Guardian C fills remaining 300 → MATCHED
+        // Guardian C fills remaining 300 → LOCKED
         vm.startPrank(guardianC);
         usdc.approve(address(bulwarc), 300e6);
         bulwarc.matchShield(0, 300e6);
@@ -158,7 +158,7 @@ contract BulwArcTest is Test {
 
         s = bulwarc.getShield(0);
         assertEq(s.filled, NOTIONAL);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.MATCHED));
+        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.LOCKED));
         assertEq(bulwarc.getFillCount(0), 3);
     }
 
@@ -200,7 +200,7 @@ contract BulwArcTest is Test {
         BulwArc.Shield memory s = bulwarc.getShield(0);
         BulwArc.Fill[] memory f = bulwarc.getFills(0);
         assertEq(f[0].guardian, guardianA);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.MATCHED));
+        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.LOCKED));
         // Backer paid, guardianA got premium
         assertEq(usdc.balanceOf(backer), 10_000e6 - NOTIONAL);
         assertEq(usdc.balanceOf(guardianA), 10_000e6 + PREMIUM);
