@@ -12,19 +12,20 @@ contract BulwArc {
 
     struct Fill {
         address guardian;
-        uint256 amount; // effective collateral in EURC (after fee)
+        uint256 amount;
     }
 
     struct Shield {
         address subscriber;
         uint256 strike;          // EUR/USD price in 1e8
-        uint256 notional;        // amount to cover in EURC (1e6)
-        uint256 premium;         // premium in USDC (1e6)
-        uint256 subscriberFee;   // fee taken from subscriber in USDC (1e6)
-        uint256 filled;          // total EURC filled so far (after guardian fees)
+        uint256 notional;        // amount to cover (1e6)
+        uint256 premium;         // premium (1e6)
+        uint256 subscriberFee;
+        uint256 filled;
         uint256 expiry;
-        uint8 deliveryRate;      // 0-100, validated % of work delivered
-        address validator;       // address authorized to set deliveryRate
+        uint8 deliveryRate;
+        address validator;
+        bool isReverse;          // false: sub=USDC, guard=EURC | true: sub=EURC, guard=USDC
         ShieldStatus status;
     }
 
@@ -34,6 +35,7 @@ contract BulwArc {
         uint256 premium;
         uint256 expiry;
         address validator;
+        bool isReverse;
     }
 
     struct MatchParams {
@@ -46,17 +48,16 @@ contract BulwArc {
     IERC20 public immutable eurc;
     IOracle public immutable oracle;
 
-    uint256 public feeBps; // fee in basis points (100 = 1%)
+    uint256 public feeBps;
     address public owner;
 
-    // Protocol treasury
     uint256 public treasuryUSDC;
     uint256 public treasuryEURC;
 
     Shield[] public shields;
     mapping(uint256 => Fill[]) public fills;
 
-    event ShieldCreated(uint256 indexed shieldId, address indexed subscriber, uint256 strike, uint256 notional, uint256 premium, uint256 expiry);
+    event ShieldCreated(uint256 indexed shieldId, address indexed subscriber, uint256 strike, uint256 notional, uint256 premium, uint256 expiry, bool isReverse);
     event ShieldFunded(uint256 indexed shieldId, address indexed funder);
     event ShieldFilled(uint256 indexed shieldId, address indexed guardian, uint256 amount);
     event ShieldLocked(uint256 indexed shieldId);
@@ -71,20 +72,43 @@ contract BulwArc {
         owner = msg.sender;
     }
 
+    // ========== TOKEN HELPERS ==========
+
+    /// @dev Premium token: USDC for normal, EURC for reverse
+    function _premiumToken(bool isReverse) internal view returns (IERC20) {
+        return isReverse ? eurc : usdc;
+    }
+
+    /// @dev Collateral token: EURC for normal, USDC for reverse
+    function _collateralToken(bool isReverse) internal view returns (IERC20) {
+        return isReverse ? usdc : eurc;
+    }
+
+    function _addTreasuryPremium(bool isReverse, uint256 amount) internal {
+        if (isReverse) { treasuryEURC += amount; } else { treasuryUSDC += amount; }
+    }
+
+    function _subTreasuryPremium(bool isReverse, uint256 amount) internal {
+        if (isReverse) { treasuryEURC -= amount; } else { treasuryUSDC -= amount; }
+    }
+
+    function _addTreasuryCollateral(bool isReverse, uint256 amount) internal {
+        if (isReverse) { treasuryUSDC += amount; } else { treasuryEURC += amount; }
+    }
+
     // ========== CREATE ==========
 
-    /// @param validator Address that can validate delivery (address(0) = no validation required)
-    function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator) external {
-        _createShield(strike, notional, premium, expiry, validator);
+    function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator, bool isReverse) external {
+        _createShield(strike, notional, premium, expiry, validator, isReverse);
     }
 
     function createShieldBatch(CreateParams[] calldata params) external {
         for (uint256 i = 0; i < params.length; i++) {
-            _createShield(params[i].strike, params[i].notional, params[i].premium, params[i].expiry, params[i].validator);
+            _createShield(params[i].strike, params[i].notional, params[i].premium, params[i].expiry, params[i].validator, params[i].isReverse);
         }
     }
 
-    function _createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator) internal {
+    function _createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator, bool isReverse) internal {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
         require(premium > 0, "Invalid premium");
@@ -101,21 +125,22 @@ contract BulwArc {
             expiry: expiry,
             deliveryRate: 0,
             validator: validator,
+            isReverse: isReverse,
             status: ShieldStatus.CREATED
         }));
 
-        emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry);
+        emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry, isReverse);
     }
 
-    function createAndFundShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator) external {
+    function createAndFundShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator, bool isReverse) external {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
         require(premium > 0, "Invalid premium");
         require(expiry > block.timestamp, "Expiry in the past");
 
         uint256 fee = premium * feeBps / 10000;
-        usdc.transferFrom(msg.sender, address(this), premium + fee);
-        treasuryUSDC += fee;
+        _premiumToken(isReverse).transferFrom(msg.sender, address(this), premium + fee);
+        _addTreasuryPremium(isReverse, fee);
 
         uint256 shieldId = shields.length;
         shields.push(Shield({
@@ -128,10 +153,11 @@ contract BulwArc {
             expiry: expiry,
             deliveryRate: 0,
             validator: validator,
+            isReverse: isReverse,
             status: ShieldStatus.PENDING
         }));
 
-        emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry);
+        emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry, isReverse);
         emit ShieldFunded(shieldId, msg.sender);
     }
 
@@ -152,17 +178,16 @@ contract BulwArc {
         require(s.status == ShieldStatus.CREATED, "Not created");
         require(block.timestamp < s.expiry, "Expired");
 
-        // Subscriber fee on premium
         uint256 fee = s.premium * feeBps / 10000;
-        usdc.transferFrom(msg.sender, address(this), s.premium + fee);
-        treasuryUSDC += fee;
+        _premiumToken(s.isReverse).transferFrom(msg.sender, address(this), s.premium + fee);
+        _addTreasuryPremium(s.isReverse, fee);
         s.subscriberFee = fee;
         s.status = ShieldStatus.PENDING;
 
         emit ShieldFunded(shieldId, msg.sender);
     }
 
-    // ========== MATCH (partial fill) — guardian deposits EURC ==========
+    // ========== MATCH ==========
 
     function matchShield(uint256 shieldId, address guardian, uint256 amount) external {
         _matchShield(shieldId, guardian, amount);
@@ -186,16 +211,16 @@ contract BulwArc {
 
         // Guardian fee on collateral
         uint256 fee = amount * feeBps / 10000;
-        eurc.transferFrom(msg.sender, address(this), amount + fee);
-        treasuryEURC += fee;
+        _collateralToken(s.isReverse).transferFrom(msg.sender, address(this), amount + fee);
+        _addTreasuryCollateral(s.isReverse, fee);
 
         fills[shieldId].push(Fill({guardian: guardian, amount: amount}));
         s.filled += amount;
 
-        // Distribute premium (USDC) pro-rata to guardian
+        // Distribute premium pro-rata to guardian
         uint256 premiumShare = s.premium * amount / s.notional;
         if (premiumShare > 0) {
-            usdc.transfer(guardian, premiumShare);
+            _premiumToken(s.isReverse).transfer(guardian, premiumShare);
         }
 
         emit ShieldFilled(shieldId, guardian, amount);
@@ -208,7 +233,6 @@ contract BulwArc {
 
     // ========== VALIDATE ==========
 
-    /// @notice Validator confirms delivery rate (0-100%)
     function validateDelivery(uint256 shieldId, uint8 rate) external {
         Shield storage s = shields[shieldId];
         require(s.validator != address(0), "No validator set");
@@ -228,7 +252,6 @@ contract BulwArc {
         require(msg.sender == s.subscriber, "Not subscriber");
         require(block.timestamp <= s.expiry, "Past expiry");
 
-        // If a validator is set, deliveryRate must be > 0
         if (s.validator != address(0)) {
             require(s.deliveryRate > 0, "Not validated");
         }
@@ -236,22 +259,30 @@ contract BulwArc {
         (int256 spot, uint256 updatedAt) = oracle.getPrice();
         require(block.timestamp <= updatedAt + 5 minutes, "Stale oracle price");
         require(spot > 0, "Invalid oracle price");
-        require(uint256(spot) < s.strike, "Not in the money");
 
-        uint256 strikeDiff = s.strike - uint256(spot);
+        // Normal: subscriber wins if spot < strike (USD weakens)
+        // Reverse: subscriber wins if spot > strike (EUR weakens)
+        if (s.isReverse) {
+            require(uint256(spot) > s.strike, "Not in the money");
+        } else {
+            require(uint256(spot) < s.strike, "Not in the money");
+        }
 
-        // Effective delivery rate: 100 if no validator, otherwise deliveryRate
+        uint256 strikeDiff = s.isReverse
+            ? uint256(spot) - s.strike
+            : s.strike - uint256(spot);
+
         uint256 rate = s.validator == address(0) ? 100 : uint256(s.deliveryRate);
 
         s.status = ShieldStatus.EXERCISED;
 
-        // Refund subscriber fee pro-rata (accounts for fill ratio + delivery rate)
         _refundSubscriberFee(s, rate);
+
+        IERC20 collateral = _collateralToken(s.isReverse);
 
         uint256 totalPayoff;
         Fill[] storage f = fills[shieldId];
         for (uint256 i = 0; i < f.length; i++) {
-            // Payoff scaled by deliveryRate
             uint256 guardianPayoff = strikeDiff * f[i].amount * rate / (s.strike * 100);
             if (guardianPayoff > f[i].amount) guardianPayoff = f[i].amount;
 
@@ -259,12 +290,12 @@ contract BulwArc {
 
             uint256 guardianRemaining = f[i].amount - guardianPayoff;
             if (guardianRemaining > 0) {
-                eurc.transfer(f[i].guardian, guardianRemaining);
+                collateral.transfer(f[i].guardian, guardianRemaining);
             }
         }
 
         if (totalPayoff > 0) {
-            eurc.transfer(s.subscriber, totalPayoff);
+            collateral.transfer(s.subscriber, totalPayoff);
         }
 
         emit ShieldExercised(shieldId, totalPayoff);
@@ -279,12 +310,12 @@ contract BulwArc {
 
         s.status = ShieldStatus.EXPIRED;
 
-        // On expire, delivery doesn't matter — refund fee based on fill ratio only
         _refundSubscriberFee(s, 100);
 
+        IERC20 collateral = _collateralToken(s.isReverse);
         Fill[] storage f = fills[shieldId];
         for (uint256 i = 0; i < f.length; i++) {
-            eurc.transfer(f[i].guardian, f[i].amount);
+            collateral.transfer(f[i].guardian, f[i].amount);
         }
 
         emit ShieldExpired(shieldId);
@@ -301,11 +332,10 @@ contract BulwArc {
         s.status = ShieldStatus.EXPIRED;
 
         if (prev == ShieldStatus.PENDING) {
-            // Return premium + full fee (nothing was filled)
             uint256 refund = s.premium + s.subscriberFee;
-            treasuryUSDC -= s.subscriberFee;
+            _subTreasuryPremium(s.isReverse, s.subscriberFee);
             s.subscriberFee = 0;
-            usdc.transfer(s.subscriber, refund);
+            _premiumToken(s.isReverse).transfer(s.subscriber, refund);
         }
     }
 
@@ -313,21 +343,21 @@ contract BulwArc {
 
     function setFeeBps(uint256 _feeBps) external {
         require(msg.sender == owner, "Not owner");
-        require(_feeBps <= 1000, "Fee too high"); // max 10%
+        require(_feeBps <= 1000, "Fee too high");
         feeBps = _feeBps;
     }
 
     function withdrawTreasury(address to) external {
         require(msg.sender == owner, "Not owner");
         if (treasuryUSDC > 0) {
-            uint256 amount = treasuryUSDC;
+            uint256 a = treasuryUSDC;
             treasuryUSDC = 0;
-            usdc.transfer(to, amount);
+            usdc.transfer(to, a);
         }
         if (treasuryEURC > 0) {
-            uint256 amount = treasuryEURC;
+            uint256 a = treasuryEURC;
             treasuryEURC = 0;
-            eurc.transfer(to, amount);
+            eurc.transfer(to, a);
         }
     }
 
@@ -351,16 +381,14 @@ contract BulwArc {
 
     // ========== INTERNAL ==========
 
-    /// @dev Refund subscriber fee pro-rata based on fill ratio and delivery rate
-    /// usedFee = subscriberFee * (filled / notional) * (rate / 100)
     function _refundSubscriberFee(Shield storage s, uint256 rate) internal {
         if (s.subscriberFee == 0) return;
 
         uint256 usedFee = s.subscriberFee * s.filled * rate / (s.notional * 100);
         uint256 refund = s.subscriberFee - usedFee;
         if (refund > 0) {
-            treasuryUSDC -= refund;
-            usdc.transfer(s.subscriber, refund);
+            _subTreasuryPremium(s.isReverse, refund);
+            _premiumToken(s.isReverse).transfer(s.subscriber, refund);
         }
     }
 }
