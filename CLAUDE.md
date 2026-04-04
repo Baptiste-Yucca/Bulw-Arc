@@ -1,9 +1,10 @@
-# CLAUDE.md — FXOptionVault
+# CLAUDE.md — BulwArc
 
 ## Contexte du projet
 
 Projet hackathon Circle / Arc.
-On construit un marché d'options FX EUR/USD on-chain où le smart contract joue le rôle de la banque (market maker).
+On construit un protocole de protection (shield) FX EUR/USD on-chain en P2P.
+Terminologie : on ne parle jamais d'"option". On utilise "shield" / "protection" / "cover".
 
 ---
 
@@ -44,7 +45,7 @@ USDC : 0x3600000000000000000000000000000000000000
 EURC : 0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a
 ```
 
-L'oracle EUR/USD est natif Arc — ne pas utiliser Chainlink.
+Il n'y a pas d'oracle natif sur Arc. On utilise un MockOracle (owner-settable) alimenté par un bot off-chain.
 
 ---
 
@@ -56,7 +57,7 @@ curl -L https://foundry.paradigm.xyz | bash
 foundryup
 
 # Init projet
-forge init fx-option-vault && cd fx-option-vault
+cd bulwarc
 ```
 
 ### `.env` requis
@@ -64,7 +65,8 @@ forge init fx-option-vault && cd fx-option-vault
 ```
 ARC_TESTNET_RPC_URL="https://rpc.testnet.arc.network"
 PRIVATE_KEY="0x..."
-FXOPTIONVAULT_ADDRESS="0x..."   # rempli après deploy
+BULWARC_ADDRESS=""              # rempli après deploy
+MOCK_ORACLE_ADDRESS=""          # rempli après deploy
 ```
 
 ### Commandes clés
@@ -81,7 +83,7 @@ forge create src/MySmartcontract.sol:MySmartcontract \
   --broadcast
 
 # Interagir
-cast call $FXOPTIONVAULT_ADDRESS "getOrder(uint256)(tuple)" 0 \
+cast call $BULWARC_ADDRESS "getShield(uint256)" 0 \
   --rpc-url $ARC_TESTNET_RPC_URL
 ```
 
@@ -92,90 +94,95 @@ cast call $FXOPTIONVAULT_ADDRESS "getOrder(uint256)(tuple)" 0 \
 ### Fichiers
 
 ```
-src/
-  MySmartcontract.sol     # contrat principal
-  interfaces/
-    IOracle.sol         # interface oracle EUR/USD Arc natif
-test/
-  Mytest.t.sol   # tests Foundry
-script/
-  Deploy.s.sol          # script de déploiement
+bulwarc/
+  src/
+    BulwArc.sol             # contrat principal
+    mocks/
+      MockOracle.sol        # oracle EUR/USD settable par owner
+  test/
+    BulwArc.t.sol           # tests Foundry
+  script/
+    Deploy.s.sol            # script de déploiement
+    deploy-and-verify.sh    # deploy + verify en une commande
 ```
 
 ### Structs core
 
-``` Pseudo code
-enum OptionType { PUT, CALL }
-enum OrderStatus { PENDING, MATCHED, EXERCISED, EXPIRED }
+```solidity
+enum ShieldStatus { PENDING, MATCHED, EXERCISED, EXPIRED }
 
-struct OptionOrder {
-    address maker;
-    OptionType optionType;
-    uint256 strike;         // prix en 1e8 (ex: 0.45 USD/EUR = 45_000_000)
-    uint256 notional;       // en USDC, 1e6
-    uint256 amountFilled;   // partial fill : montant déjà matché
-    uint256 premium;        // prime en USDC, 1e6
-    uint256 expiry;         // timestamp Unix
-    OrderStatus status;
-    address counterparty;   // adresse du matcher (0x0 si PENDING)
+struct Shield {
+    address subscriber;   // worker qui souscrit la protection
+    uint256 strike;       // EUR/USD en 1e8 (ex: 92_000_000 = 0.92)
+    uint256 notional;     // montant couvert en USDC (1e6)
+    uint256 premium;      // prime en USDC (1e6)
+    uint256 expiry;       // timestamp Unix
+    ShieldStatus status;
+    address guardian;     // celui qui prend le risque (0x0 si PENDING)
 }
 ```
 
 ### Fonctions principales
 
+```solidity
+// Subscriber crée un shield
+function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external;
+// Un tiers crée un shield pour un subscriber (employeur paie la prime)
+function createShieldFor(address subscriber, uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external;
 
-// Matcher un ordre existant (partial fill supporté)
-function matchOrder(uint256 orderId, uint256 amount) external;
+// Guardian matche un shield
+function matchShield(uint256 shieldId) external;
+// Un tiers matche pour un guardian
+function matchShieldFor(uint256 shieldId, address guardian) external;
 
-// Exercer une option américaine (à tout moment avant expiry)
-function exercise(uint256 orderId) external;
+// Subscriber exerce si EUR/USD spot < strike
+function exercise(uint256 shieldId) external;
 
-// Récupérer le collateral si option non exercée après expiry
-function expire(uint256 orderId) external;
+// Récupérer le collateral après expiry
+function expire(uint256 shieldId) external;
+
+// Annuler un shield non matché
+function cancel(uint256 shieldId) external;
 ```
 
 ---
 
-## Logique métier (DRAFT)
+## Logique métier
 
 ### Maturités standardisées (MVP)
 
-Pour simplifier le matching : 7 jours / 30 jours / 90 jours uniquement.
-Validation : `require(expiry == block.timestamp + 7 days || ...)`.
-
-### Matching (Queue FIFO + partial fill)
-
-- Deux queues séparées : `putQueue` et `callQueue`
-- Match si : même strike ET même expiry ET `amountFilled < notional`
-- Partial fill : le maker garde son ordre en PENDING avec `amountFilled` mis à jour
-- Le notionnel restant = `notional - amountFilled`
+7 jours / 30 jours / 90 jours (tolérance ±1h).
 
 ### Condition d'exercice
 
 ```
-PUT  : oracle.getPrice() < strike  →  payoff = (strike - spot) × amount / 1e8
-CALL : oracle.getPrice() > strike  →  payoff = (spot - strike) × amount / 1e8
+oracle.getPrice() < strike  →  payoff = (strike - spot) × notional / 1e8
 ```
 
-Vérifier la fraîcheur du prix oracle : `require(oracle.updatedAt() > block.timestamp - 5 minutes)`.
+Fraîcheur oracle : `block.timestamp <= updatedAt + 5 minutes`.
 
 ### Flux de tokens
 
-| Étape | PUT maker (américain) | CALL maker (européen) |
+| Étape | Subscriber (worker) | Guardian |
 |---|---|---|
-| `openPosition` | Dépose prime en USDC | Dépose prime en EURC |
-| `matchOrder` | Counterparty dépose collateral USDC | Counterparty dépose collateral EURC |
-| `exercise` | Reçoit payoff USDC | Reçoit payoff EURC |
-| `expire` | Récupère collateral | Récupère collateral |
+| `createShield` | Dépose prime USDC | — |
+| `matchShield` | — | Dépose collateral USDC, reçoit prime |
+| `exercise` | Reçoit payoff USDC | Reçoit collateral restant |
+| `expire` | — | Récupère collateral |
+
+### OnBehalf
+
+Un tiers (employeur, backer) peut payer via `createShieldFor` / `matchShieldFor`.
+Les droits (exercise, cancel) restent au subscriber/guardian désigné.
 
 ---
 
 ## Ce que le jury attend (critères prize)
 
-- [x] Conditional flows → logique d'exercice conditionnelle via oracle
-- [x] Onchain automation → trigger automatique settle via timestamp / oracle
-- [x] Multi-step settlement → openPosition → match → exercise → settle
-- [x] USDC + EURC utilisés nativement
+- [x] Conditional flows → exercice conditionnel via oracle
+- [x] Onchain automation → settle via timestamp / oracle
+- [x] Multi-step settlement → createShield → match → exercise → settle
+- [x] USDC utilisé nativement
 - [x] MVP fonctionnel + frontend + diagramme d'architecture
 
 ---
@@ -183,9 +190,8 @@ Vérifier la fraîcheur du prix oracle : `require(oracle.updatedAt() > block.tim
 ## Ce qu'on ne fait PAS (hors scope MVP)
 
 - Crosschain (CCTP / Gateway) → v2
-- AMM / price discovery → queue FIFO suffit
-- Partial fill sur les dates → dates standardisées
-- Agrégation multi-ordres → un match = deux contreparties
+- AMM / price discovery → P2P suffit
+- Partial fill → un shield = un subscriber + un guardian
 
 ---
 
@@ -193,6 +199,6 @@ Vérifier la fraîcheur du prix oracle : `require(oracle.updatedAt() > block.tim
 
 - Solidity `^0.8.30` (compatible Arc)
 - Tous les montants token en `1e6` (USDC/EURC sont 6 décimales)
-- Events sur chaque action : `OrderOpened`, `OrderMatched`, `OptionExercised`, `OptionExpired`
+- Events : `ShieldCreated`, `ShieldMatched`, `ShieldExercised`, `ShieldExpired`
 - `require` avec messages explicites
 - Pas d'upgradability pour le MVP
