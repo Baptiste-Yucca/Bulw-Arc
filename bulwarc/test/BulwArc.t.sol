@@ -46,7 +46,7 @@ contract BulwArcTest is Test {
     MockUSDC public usdc;
 
     address worker = makeAddr("worker");
-    address counterparty = makeAddr("counterparty");
+    address guardian = makeAddr("guardian");
 
     uint256 constant STRIKE = 92_000_000; // 0.92 EUR/USD
     uint256 constant NOTIONAL = 1000e6;   // 1000 USDC
@@ -58,7 +58,7 @@ contract BulwArcTest is Test {
         shield = new BulwArc(address(usdc), address(oracle));
 
         usdc.mint(worker, 100e6);
-        usdc.mint(counterparty, 10_000e6);
+        usdc.mint(guardian, 10_000e6);
     }
 
     function test_createShield() public {
@@ -70,30 +70,30 @@ contract BulwArcTest is Test {
         vm.stopPrank();
 
         BulwArc.Shield memory s = shield.getShield(0);
-        assertEq(s.maker, worker);
+        assertEq(s.subscriber, worker);
         assertEq(s.strike, STRIKE);
         assertEq(s.notional, NOTIONAL);
         assertEq(s.premium, PREMIUM);
         assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.PENDING));
-        assertEq(s.counterparty, address(0));
+        assertEq(s.guardian, address(0));
     }
 
     function test_matchShield() public {
         uint256 expiry = block.timestamp + 30 days;
         _createShield(expiry);
 
-        uint256 cpBalanceBefore = usdc.balanceOf(counterparty);
+        uint256 cpBalanceBefore = usdc.balanceOf(guardian);
 
-        vm.startPrank(counterparty);
+        vm.startPrank(guardian);
         usdc.approve(address(shield), NOTIONAL);
         shield.matchShield(0);
         vm.stopPrank();
 
         BulwArc.Shield memory s = shield.getShield(0);
         assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.MATCHED));
-        assertEq(s.counterparty, counterparty);
+        assertEq(s.guardian, guardian);
         // Counterparty received premium
-        assertEq(usdc.balanceOf(counterparty), cpBalanceBefore - NOTIONAL + PREMIUM);
+        assertEq(usdc.balanceOf(guardian), cpBalanceBefore - NOTIONAL + PREMIUM);
     }
 
     function test_exercise_inTheMoney() public {
@@ -104,7 +104,7 @@ contract BulwArcTest is Test {
         oracle.setPrice(88_000_000);
 
         uint256 workerBefore = usdc.balanceOf(worker);
-        uint256 cpBefore = usdc.balanceOf(counterparty);
+        uint256 cpBefore = usdc.balanceOf(guardian);
 
         vm.prank(worker);
         shield.exercise(0);
@@ -112,7 +112,7 @@ contract BulwArcTest is Test {
         // payoff = (0.92 - 0.88) * 1000 / 1 = 40 USDC
         uint256 expectedPayoff = (STRIKE - 88_000_000) * NOTIONAL / 1e8;
         assertEq(usdc.balanceOf(worker), workerBefore + expectedPayoff);
-        assertEq(usdc.balanceOf(counterparty), cpBefore + NOTIONAL - expectedPayoff);
+        assertEq(usdc.balanceOf(guardian), cpBefore + NOTIONAL - expectedPayoff);
 
         BulwArc.Shield memory s = shield.getShield(0);
         assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.EXERCISED));
@@ -128,12 +128,12 @@ contract BulwArcTest is Test {
         // Warp past expiry
         vm.warp(expiry + 1);
 
-        uint256 cpBefore = usdc.balanceOf(counterparty);
+        uint256 cpBefore = usdc.balanceOf(guardian);
 
         shield.expire(0);
 
         // Counterparty gets full collateral back
-        assertEq(usdc.balanceOf(counterparty), cpBefore + NOTIONAL);
+        assertEq(usdc.balanceOf(guardian), cpBefore + NOTIONAL);
 
         BulwArc.Shield memory s = shield.getShield(0);
         assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.EXPIRED));
@@ -156,8 +156,8 @@ contract BulwArcTest is Test {
         _createAndMatch(expiry);
         oracle.setPrice(88_000_000);
 
-        vm.prank(counterparty);
-        vm.expectRevert("Not maker");
+        vm.prank(guardian);
+        vm.expectRevert("Not subscriber");
         shield.exercise(0);
     }
 
@@ -194,6 +194,97 @@ contract BulwArcTest is Test {
         vm.stopPrank();
     }
 
+    // --- onBehalf tests ---
+
+    address employer = makeAddr("employer");
+    address backer = makeAddr("backer");
+
+    function test_createShieldFor_onBehalf() public {
+        uint256 expiry = block.timestamp + 30 days;
+        usdc.mint(employer, 100e6);
+
+        // Employer pays premium on behalf of worker
+        vm.startPrank(employer);
+        usdc.approve(address(shield), PREMIUM);
+        shield.createShieldFor(worker, STRIKE, NOTIONAL, PREMIUM, expiry);
+        vm.stopPrank();
+
+        BulwArc.Shield memory s = shield.getShield(0);
+        assertEq(s.subscriber, worker);
+        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.PENDING));
+        // Employer paid, not worker
+        assertEq(usdc.balanceOf(employer), 100e6 - PREMIUM);
+        assertEq(usdc.balanceOf(worker), 100e6); // unchanged
+    }
+
+    function test_matchShieldFor_onBehalf() public {
+        uint256 expiry = block.timestamp + 30 days;
+        _createShield(expiry);
+        usdc.mint(backer, 10_000e6);
+
+        // Backer funds collateral on behalf of guardian
+        vm.startPrank(backer);
+        usdc.approve(address(shield), NOTIONAL);
+        shield.matchShieldFor(0, guardian);
+        vm.stopPrank();
+
+        BulwArc.Shield memory s = shield.getShield(0);
+        assertEq(s.guardian, guardian);
+        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.MATCHED));
+        // Backer paid collateral, guardian received premium
+        assertEq(usdc.balanceOf(backer), 10_000e6 - NOTIONAL);
+        assertEq(usdc.balanceOf(guardian), 10_000e6 + PREMIUM);
+    }
+
+    function test_exercise_after_createShieldFor() public {
+        uint256 expiry = block.timestamp + 30 days;
+        usdc.mint(employer, 100e6);
+
+        // Employer creates shield for worker
+        vm.startPrank(employer);
+        usdc.approve(address(shield), PREMIUM);
+        shield.createShieldFor(worker, STRIKE, NOTIONAL, PREMIUM, expiry);
+        vm.stopPrank();
+
+        // Guardian matches
+        vm.startPrank(guardian);
+        usdc.approve(address(shield), NOTIONAL);
+        shield.matchShield(0);
+        vm.stopPrank();
+
+        // Price drops, worker exercises (not employer)
+        oracle.setPrice(88_000_000);
+        uint256 workerBefore = usdc.balanceOf(worker);
+
+        vm.prank(worker);
+        shield.exercise(0);
+
+        uint256 expectedPayoff = (STRIKE - 88_000_000) * NOTIONAL / 1e8;
+        assertEq(usdc.balanceOf(worker), workerBefore + expectedPayoff);
+    }
+
+    function test_revert_exercise_by_employer() public {
+        uint256 expiry = block.timestamp + 30 days;
+        usdc.mint(employer, 100e6);
+
+        vm.startPrank(employer);
+        usdc.approve(address(shield), PREMIUM);
+        shield.createShieldFor(worker, STRIKE, NOTIONAL, PREMIUM, expiry);
+        vm.stopPrank();
+
+        vm.startPrank(guardian);
+        usdc.approve(address(shield), NOTIONAL);
+        shield.matchShield(0);
+        vm.stopPrank();
+
+        oracle.setPrice(88_000_000);
+
+        // Employer cannot exercise — only subscriber can
+        vm.prank(employer);
+        vm.expectRevert("Not subscriber");
+        shield.exercise(0);
+    }
+
     // --- helpers ---
 
     function _createShield(uint256 expiry) internal {
@@ -205,7 +296,7 @@ contract BulwArcTest is Test {
 
     function _createAndMatch(uint256 expiry) internal {
         _createShield(expiry);
-        vm.startPrank(counterparty);
+        vm.startPrank(guardian);
         usdc.approve(address(shield), NOTIONAL);
         shield.matchShield(0);
         vm.stopPrank();
