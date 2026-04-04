@@ -25,11 +25,24 @@ contract BulwArc {
         ShieldStatus status;
     }
 
+    struct CreateParams {
+        uint256 strike;
+        uint256 notional;
+        uint256 premium;
+        uint256 expiry;
+    }
+
+    struct MatchParams {
+        uint256 shieldId;
+        address guardian;
+        uint256 amount;
+    }
+
     IERC20 public immutable usdc;
     IOracle public immutable oracle;
 
     Shield[] public shields;
-    mapping(uint256 => Fill[]) public fills; // shieldId => fills
+    mapping(uint256 => Fill[]) public fills;
 
     event ShieldCreated(uint256 indexed shieldId, address indexed subscriber, uint256 strike, uint256 notional, uint256 premium, uint256 expiry);
     event ShieldFunded(uint256 indexed shieldId, address indexed funder);
@@ -46,6 +59,16 @@ contract BulwArc {
     // ========== CREATE ==========
 
     function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external {
+        _createShield(strike, notional, premium, expiry);
+    }
+
+    function createShieldBatch(CreateParams[] calldata params) external {
+        for (uint256 i = 0; i < params.length; i++) {
+            _createShield(params[i].strike, params[i].notional, params[i].premium, params[i].expiry);
+        }
+    }
+
+    function _createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) internal {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
         require(premium > 0, "Invalid premium");
@@ -91,6 +114,16 @@ contract BulwArc {
     // ========== FUND ==========
 
     function fundShield(uint256 shieldId) external {
+        _fundShield(shieldId);
+    }
+
+    function fundShieldBatch(uint256[] calldata shieldIds) external {
+        for (uint256 i = 0; i < shieldIds.length; i++) {
+            _fundShield(shieldIds[i]);
+        }
+    }
+
+    function _fundShield(uint256 shieldId) internal {
         Shield storage s = shields[shieldId];
         require(s.status == ShieldStatus.CREATED, "Not created");
         require(block.timestamp < s.expiry, "Expired");
@@ -103,19 +136,21 @@ contract BulwArc {
 
     // ========== MATCH (partial fill) ==========
 
-    function matchShield(uint256 shieldId, uint256 amount) external {
-        _matchShield(shieldId, msg.sender, amount);
+    function matchShield(uint256 shieldId, address guardian, uint256 amount) external {
+        _matchShield(shieldId, guardian, amount);
     }
 
-    function matchShieldFor(uint256 shieldId, address guardian, uint256 amount) external {
-        require(guardian != address(0), "Invalid guardian");
-        _matchShield(shieldId, guardian, amount);
+    function matchShieldBatch(MatchParams[] calldata params) external {
+        for (uint256 i = 0; i < params.length; i++) {
+            _matchShield(params[i].shieldId, params[i].guardian, params[i].amount);
+        }
     }
 
     function _matchShield(uint256 shieldId, address guardian, uint256 amount) internal {
         Shield storage s = shields[shieldId];
         require(s.status == ShieldStatus.PENDING, "Not pending");
         require(block.timestamp < s.expiry, "Expired");
+        require(guardian != address(0), "Invalid guardian");
         require(amount > 0, "Invalid amount");
 
         uint256 remaining = s.notional - s.filled;
@@ -154,7 +189,7 @@ contract BulwArc {
         require(spot > 0, "Invalid oracle price");
         require(uint256(spot) < s.strike, "Not in the money");
 
-        uint256 payoffPerUnit = s.strike - uint256(spot); // in 1e8
+        uint256 payoffPerUnit = s.strike - uint256(spot);
 
         s.status = ShieldStatus.EXERCISED;
 
@@ -166,14 +201,12 @@ contract BulwArc {
 
             totalPayoff += guardianPayoff;
 
-            // Return remaining collateral to guardian
             uint256 guardianRemaining = f[i].amount - guardianPayoff;
             if (guardianRemaining > 0) {
                 usdc.transfer(f[i].guardian, guardianRemaining);
             }
         }
 
-        // Pay subscriber total payoff
         if (totalPayoff > 0) {
             usdc.transfer(s.subscriber, totalPayoff);
         }
@@ -190,7 +223,6 @@ contract BulwArc {
 
         s.status = ShieldStatus.EXPIRED;
 
-        // Return collateral to each guardian
         Fill[] storage f = fills[shieldId];
         for (uint256 i = 0; i < f.length; i++) {
             usdc.transfer(f[i].guardian, f[i].amount);

@@ -88,6 +88,22 @@ contract BulwArcTest is Test {
         assertEq(usdc.balanceOf(worker), 100e6 - PREMIUM);
     }
 
+    function test_createShieldBatch() public {
+        uint256 expiry = block.timestamp + 30 days;
+        BulwArc.CreateParams[] memory params = new BulwArc.CreateParams[](3);
+        params[0] = BulwArc.CreateParams(STRIKE, NOTIONAL, PREMIUM, expiry);
+        params[1] = BulwArc.CreateParams(90_000_000, 500e6, 3e6, expiry);
+        params[2] = BulwArc.CreateParams(95_000_000, 2000e6, 10e6, expiry);
+
+        vm.prank(worker);
+        bulwarc.createShieldBatch(params);
+
+        assertEq(bulwarc.getShieldCount(), 3);
+        assertEq(bulwarc.getShield(0).notional, NOTIONAL);
+        assertEq(bulwarc.getShield(1).notional, 500e6);
+        assertEq(bulwarc.getShield(2).notional, 2000e6);
+    }
+
     // ========== FUND ==========
 
     function test_fundShield_by_employer() public {
@@ -106,6 +122,27 @@ contract BulwArcTest is Test {
         assertEq(usdc.balanceOf(worker), 100e6);
     }
 
+    function test_fundShieldBatch() public {
+        uint256 expiry = block.timestamp + 30 days;
+
+        vm.startPrank(worker);
+        bulwarc.createShield(STRIKE, NOTIONAL, PREMIUM, expiry);
+        bulwarc.createShield(90_000_000, 500e6, 3e6, expiry);
+        vm.stopPrank();
+
+        vm.startPrank(employer);
+        usdc.approve(address(bulwarc), PREMIUM + 3e6);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = 0;
+        ids[1] = 1;
+        bulwarc.fundShieldBatch(ids);
+        vm.stopPrank();
+
+        assertEq(uint8(bulwarc.getShield(0).status), uint8(BulwArc.ShieldStatus.PENDING));
+        assertEq(uint8(bulwarc.getShield(1).status), uint8(BulwArc.ShieldStatus.PENDING));
+        assertEq(usdc.balanceOf(employer), 100e6 - PREMIUM - 3e6);
+    }
+
     // ========== MATCH — single guardian ==========
 
     function test_matchShield_full() public {
@@ -115,7 +152,7 @@ contract BulwArcTest is Test {
 
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), NOTIONAL);
-        bulwarc.matchShield(0, NOTIONAL);
+        bulwarc.matchShield(0, guardianA, NOTIONAL);
         vm.stopPrank();
 
         BulwArc.Shield memory s = bulwarc.getShield(0);
@@ -130,35 +167,28 @@ contract BulwArcTest is Test {
     function test_matchShield_partial_multi_guardians() public {
         _createAndFund();
 
-        // Guardian A fills 200
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 200e6);
-        bulwarc.matchShield(0, 200e6);
+        bulwarc.matchShield(0, guardianA, 200e6);
         vm.stopPrank();
 
-        BulwArc.Shield memory s = bulwarc.getShield(0);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.PENDING));
-        assertEq(s.filled, 200e6);
+        assertEq(bulwarc.getShield(0).filled, 200e6);
+        assertEq(uint8(bulwarc.getShield(0).status), uint8(BulwArc.ShieldStatus.PENDING));
 
-        // Guardian B fills 500
         vm.startPrank(guardianB);
         usdc.approve(address(bulwarc), 500e6);
-        bulwarc.matchShield(0, 500e6);
+        bulwarc.matchShield(0, guardianB, 500e6);
         vm.stopPrank();
 
-        s = bulwarc.getShield(0);
-        assertEq(s.filled, 700e6);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.PENDING));
+        assertEq(bulwarc.getShield(0).filled, 700e6);
 
-        // Guardian C fills remaining 300 → LOCKED
         vm.startPrank(guardianC);
         usdc.approve(address(bulwarc), 300e6);
-        bulwarc.matchShield(0, 300e6);
+        bulwarc.matchShield(0, guardianC, 300e6);
         vm.stopPrank();
 
-        s = bulwarc.getShield(0);
-        assertEq(s.filled, NOTIONAL);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.LOCKED));
+        assertEq(bulwarc.getShield(0).filled, NOTIONAL);
+        assertEq(uint8(bulwarc.getShield(0).status), uint8(BulwArc.ShieldStatus.LOCKED));
         assertEq(bulwarc.getFillCount(0), 3);
     }
 
@@ -168,16 +198,14 @@ contract BulwArcTest is Test {
         uint256 aBefore = usdc.balanceOf(guardianA);
         uint256 bBefore = usdc.balanceOf(guardianB);
 
-        // A fills 200/1000 → gets 20% of premium = 1 USDC
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 200e6);
-        bulwarc.matchShield(0, 200e6);
+        bulwarc.matchShield(0, guardianA, 200e6);
         vm.stopPrank();
 
-        // B fills 800/1000 → gets 80% of premium = 4 USDC
         vm.startPrank(guardianB);
         usdc.approve(address(bulwarc), 800e6);
-        bulwarc.matchShield(0, 800e6);
+        bulwarc.matchShield(0, guardianB, 800e6);
         vm.stopPrank();
 
         assertEq(usdc.balanceOf(guardianA), aBefore - 200e6 + 1e6);
@@ -186,27 +214,51 @@ contract BulwArcTest is Test {
 
     // ========== MATCH — on behalf ==========
 
-    function test_matchShieldFor() public {
+    function test_matchShield_onBehalf() public {
         _createAndFund();
 
         address backer = makeAddr("backer");
         usdc.mint(backer, 10_000e6);
 
+        // Backer pays, guardianA is the guardian
         vm.startPrank(backer);
         usdc.approve(address(bulwarc), NOTIONAL);
-        bulwarc.matchShieldFor(0, guardianA, NOTIONAL);
+        bulwarc.matchShield(0, guardianA, NOTIONAL);
         vm.stopPrank();
 
-        BulwArc.Shield memory s = bulwarc.getShield(0);
         BulwArc.Fill[] memory f = bulwarc.getFills(0);
         assertEq(f[0].guardian, guardianA);
-        assertEq(uint8(s.status), uint8(BulwArc.ShieldStatus.LOCKED));
-        // Backer paid, guardianA got premium
+        assertEq(uint8(bulwarc.getShield(0).status), uint8(BulwArc.ShieldStatus.LOCKED));
         assertEq(usdc.balanceOf(backer), 10_000e6 - NOTIONAL);
         assertEq(usdc.balanceOf(guardianA), 10_000e6 + PREMIUM);
     }
 
-    // ========== EXERCISE — fully matched ==========
+    // ========== MATCH — batch ==========
+
+    function test_matchShieldBatch() public {
+        uint256 expiry = block.timestamp + 30 days;
+
+        // Create 2 shields
+        vm.startPrank(worker);
+        usdc.approve(address(bulwarc), PREMIUM * 2);
+        bulwarc.createAndFundShield(STRIKE, 500e6, PREMIUM, expiry);
+        bulwarc.createAndFundShield(90_000_000, 500e6, PREMIUM, expiry);
+        vm.stopPrank();
+
+        // GuardianA matches both in one tx
+        vm.startPrank(guardianA);
+        usdc.approve(address(bulwarc), 1000e6);
+        BulwArc.MatchParams[] memory params = new BulwArc.MatchParams[](2);
+        params[0] = BulwArc.MatchParams(0, guardianA, 500e6);
+        params[1] = BulwArc.MatchParams(1, guardianA, 500e6);
+        bulwarc.matchShieldBatch(params);
+        vm.stopPrank();
+
+        assertEq(uint8(bulwarc.getShield(0).status), uint8(BulwArc.ShieldStatus.LOCKED));
+        assertEq(uint8(bulwarc.getShield(1).status), uint8(BulwArc.ShieldStatus.LOCKED));
+    }
+
+    // ========== EXERCISE ==========
 
     function test_exercise_inTheMoney_single_guardian() public {
         _createFundAndMatch();
@@ -218,7 +270,6 @@ contract BulwArcTest is Test {
         vm.prank(worker);
         bulwarc.exercise(0);
 
-        // payoff = (0.92 - 0.88) * 1000 = 40 USDC
         uint256 expectedPayoff = (STRIKE - 88_000_000) * NOTIONAL / 1e8;
         assertEq(usdc.balanceOf(worker), workerBefore + expectedPayoff);
         assertEq(usdc.balanceOf(guardianA), gBefore + NOTIONAL - expectedPayoff);
@@ -227,15 +278,14 @@ contract BulwArcTest is Test {
     function test_exercise_inTheMoney_multi_guardians() public {
         _createAndFund();
 
-        // A fills 400, B fills 600
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 400e6);
-        bulwarc.matchShield(0, 400e6);
+        bulwarc.matchShield(0, guardianA, 400e6);
         vm.stopPrank();
 
         vm.startPrank(guardianB);
         usdc.approve(address(bulwarc), 600e6);
-        bulwarc.matchShield(0, 600e6);
+        bulwarc.matchShield(0, guardianB, 600e6);
         vm.stopPrank();
 
         oracle.setPrice(88_000_000);
@@ -247,9 +297,6 @@ contract BulwArcTest is Test {
         vm.prank(worker);
         bulwarc.exercise(0);
 
-        // payoff per unit = (92000000 - 88000000) = 4000000 out of 1e8
-        // A: payoff = 4000000 * 400e6 / 1e8 = 16e6, remaining = 384e6
-        // B: payoff = 4000000 * 600e6 / 1e8 = 24e6, remaining = 576e6
         uint256 payoffA = 4_000_000 * 400e6 / 1e8;
         uint256 payoffB = 4_000_000 * 600e6 / 1e8;
 
@@ -258,15 +305,12 @@ contract BulwArcTest is Test {
         assertEq(usdc.balanceOf(guardianB), bBefore + 600e6 - payoffB);
     }
 
-    // ========== EXERCISE — partially filled ==========
-
     function test_exercise_partial_fill() public {
         _createAndFund();
 
-        // Only 800/1000 filled
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 800e6);
-        bulwarc.matchShield(0, 800e6);
+        bulwarc.matchShield(0, guardianA, 800e6);
         vm.stopPrank();
 
         oracle.setPrice(88_000_000);
@@ -275,12 +319,9 @@ contract BulwArcTest is Test {
         vm.prank(worker);
         bulwarc.exercise(0);
 
-        // Payoff only on 800 covered: (0.92-0.88)*800 = 32 USDC
         uint256 expectedPayoff = 4_000_000 * 800e6 / 1e8;
         assertEq(usdc.balanceOf(worker), workerBefore + expectedPayoff);
     }
-
-    // ========== EXERCISE — employer funded ==========
 
     function test_exercise_after_employer_funds() public {
         uint256 expiry = block.timestamp + 30 days;
@@ -294,7 +335,7 @@ contract BulwArcTest is Test {
 
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), NOTIONAL);
-        bulwarc.matchShield(0, NOTIONAL);
+        bulwarc.matchShield(0, guardianA, NOTIONAL);
         vm.stopPrank();
 
         oracle.setPrice(88_000_000);
@@ -314,12 +355,12 @@ contract BulwArcTest is Test {
 
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 400e6);
-        bulwarc.matchShield(0, 400e6);
+        bulwarc.matchShield(0, guardianA, 400e6);
         vm.stopPrank();
 
         vm.startPrank(guardianB);
         usdc.approve(address(bulwarc), 600e6);
-        bulwarc.matchShield(0, 600e6);
+        bulwarc.matchShield(0, guardianB, 600e6);
         vm.stopPrank();
 
         vm.warp(bulwarc.getShield(0).expiry + 1);
@@ -338,7 +379,7 @@ contract BulwArcTest is Test {
 
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 500e6);
-        bulwarc.matchShield(0, 500e6);
+        bulwarc.matchShield(0, guardianA, 500e6);
         vm.stopPrank();
 
         vm.warp(bulwarc.getShield(0).expiry + 1);
@@ -374,7 +415,7 @@ contract BulwArcTest is Test {
 
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), 200e6);
-        bulwarc.matchShield(0, 200e6);
+        bulwarc.matchShield(0, guardianA, 200e6);
         vm.stopPrank();
 
         vm.expectRevert("Already has fills");
@@ -428,7 +469,7 @@ contract BulwArcTest is Test {
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), NOTIONAL + 1);
         vm.expectRevert("Exceeds remaining");
-        bulwarc.matchShield(0, NOTIONAL + 1);
+        bulwarc.matchShield(0, guardianA, NOTIONAL + 1);
         vm.stopPrank();
     }
 
@@ -440,7 +481,7 @@ contract BulwArcTest is Test {
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), NOTIONAL);
         vm.expectRevert("Not pending");
-        bulwarc.matchShield(0, NOTIONAL);
+        bulwarc.matchShield(0, guardianA, NOTIONAL);
         vm.stopPrank();
     }
 
@@ -467,7 +508,7 @@ contract BulwArcTest is Test {
         _createAndFund();
         vm.startPrank(guardianA);
         usdc.approve(address(bulwarc), NOTIONAL);
-        bulwarc.matchShield(0, NOTIONAL);
+        bulwarc.matchShield(0, guardianA, NOTIONAL);
         vm.stopPrank();
     }
 }

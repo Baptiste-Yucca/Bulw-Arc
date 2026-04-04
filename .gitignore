@@ -5,7 +5,8 @@
 bulwarc/cache/
 bulwarc/out/
 bulwarc/lib/
-bulwarc/broadcast/
+bulwarc/broadcast/**/*
+!bulwarc/broadcast/**/run-latest.json
 bulwarc/lcov.info
 
 # tmp
