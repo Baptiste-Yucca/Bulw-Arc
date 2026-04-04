@@ -15,10 +15,12 @@ contract Deploy is Script {
         // Deploy mock oracle with initial EUR/USD = 0.92
         MockOracle oracle = new MockOracle(92_000_000);
         console.log("MockOracle deployed at:", address(oracle));
+        console.log("  -> https://testnet.arcscan.app/address/", address(oracle));
 
         // Deploy BulwArc
         BulwArc shield = new BulwArc(usdc, address(oracle));
         console.log("BulwArc deployed at:", address(shield));
+        console.log("  -> https://testnet.arcscan.app/address/", address(shield));
 
         vm.stopBroadcast();
     }
