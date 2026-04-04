@@ -35,7 +35,7 @@ echo ""
 echo "=== Verifying BulwArc ==="
 forge verify-contract "$BULWARC_ADDR" \
   src/BulwArc.sol:BulwArc \
-  --constructor-args $(cast abi-encode "constructor(address,address)" 0x3600000000000000000000000000000000000000 "$ORACLE_ADDR") \
+  --constructor-args $(cast abi-encode "constructor(address,address,address,uint256)" 0x3600000000000000000000000000000000000000 0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a "$ORACLE_ADDR" 100) \
   --verifier blockscout \
   --verifier-url https://testnet.arcscan.app/api/ \
   --chain-id 5042002

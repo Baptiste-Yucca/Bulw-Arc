@@ -12,16 +12,19 @@ contract BulwArc {
 
     struct Fill {
         address guardian;
-        uint256 amount;
+        uint256 amount; // effective collateral in EURC (after fee)
     }
 
     struct Shield {
         address subscriber;
-        uint256 strike;       // EUR/USD price in 1e8
-        uint256 notional;     // total amount to cover in USDC (1e6)
-        uint256 premium;      // premium in USDC (1e6)
-        uint256 filled;       // total filled so far
+        uint256 strike;          // EUR/USD price in 1e8
+        uint256 notional;        // amount to cover in EURC (1e6)
+        uint256 premium;         // premium in USDC (1e6)
+        uint256 subscriberFee;   // fee taken from subscriber in USDC (1e6)
+        uint256 filled;          // total EURC filled so far (after guardian fees)
         uint256 expiry;
+        uint8 deliveryRate;      // 0-100, validated % of work delivered
+        address validator;       // address authorized to set deliveryRate
         ShieldStatus status;
     }
 
@@ -30,6 +33,7 @@ contract BulwArc {
         uint256 notional;
         uint256 premium;
         uint256 expiry;
+        address validator;
     }
 
     struct MatchParams {
@@ -39,7 +43,15 @@ contract BulwArc {
     }
 
     IERC20 public immutable usdc;
+    IERC20 public immutable eurc;
     IOracle public immutable oracle;
+
+    uint256 public feeBps; // fee in basis points (100 = 1%)
+    address public owner;
+
+    // Protocol treasury
+    uint256 public treasuryUSDC;
+    uint256 public treasuryEURC;
 
     Shield[] public shields;
     mapping(uint256 => Fill[]) public fills;
@@ -51,24 +63,28 @@ contract BulwArc {
     event ShieldExercised(uint256 indexed shieldId, uint256 payoff);
     event ShieldExpired(uint256 indexed shieldId);
 
-    constructor(address _usdc, address _oracle) {
+    constructor(address _usdc, address _eurc, address _oracle, uint256 _feeBps) {
         usdc = IERC20(_usdc);
+        eurc = IERC20(_eurc);
         oracle = IOracle(_oracle);
+        feeBps = _feeBps;
+        owner = msg.sender;
     }
 
     // ========== CREATE ==========
 
-    function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external {
-        _createShield(strike, notional, premium, expiry);
+    /// @param validator Address that can validate delivery (address(0) = no validation required)
+    function createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator) external {
+        _createShield(strike, notional, premium, expiry, validator);
     }
 
     function createShieldBatch(CreateParams[] calldata params) external {
         for (uint256 i = 0; i < params.length; i++) {
-            _createShield(params[i].strike, params[i].notional, params[i].premium, params[i].expiry);
+            _createShield(params[i].strike, params[i].notional, params[i].premium, params[i].expiry, params[i].validator);
         }
     }
 
-    function _createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) internal {
+    function _createShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator) internal {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
         require(premium > 0, "Invalid premium");
@@ -80,21 +96,26 @@ contract BulwArc {
             strike: strike,
             notional: notional,
             premium: premium,
+            subscriberFee: 0,
             filled: 0,
             expiry: expiry,
+            deliveryRate: 0,
+            validator: validator,
             status: ShieldStatus.CREATED
         }));
 
         emit ShieldCreated(shieldId, msg.sender, strike, notional, premium, expiry);
     }
 
-    function createAndFundShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry) external {
+    function createAndFundShield(uint256 strike, uint256 notional, uint256 premium, uint256 expiry, address validator) external {
         require(strike > 0, "Invalid strike");
         require(notional > 0, "Invalid notional");
         require(premium > 0, "Invalid premium");
         require(expiry > block.timestamp, "Expiry in the past");
 
-        usdc.transferFrom(msg.sender, address(this), premium);
+        uint256 fee = premium * feeBps / 10000;
+        usdc.transferFrom(msg.sender, address(this), premium + fee);
+        treasuryUSDC += fee;
 
         uint256 shieldId = shields.length;
         shields.push(Shield({
@@ -102,8 +123,11 @@ contract BulwArc {
             strike: strike,
             notional: notional,
             premium: premium,
+            subscriberFee: fee,
             filled: 0,
             expiry: expiry,
+            deliveryRate: 0,
+            validator: validator,
             status: ShieldStatus.PENDING
         }));
 
@@ -128,13 +152,17 @@ contract BulwArc {
         require(s.status == ShieldStatus.CREATED, "Not created");
         require(block.timestamp < s.expiry, "Expired");
 
-        usdc.transferFrom(msg.sender, address(this), s.premium);
+        // Subscriber fee on premium
+        uint256 fee = s.premium * feeBps / 10000;
+        usdc.transferFrom(msg.sender, address(this), s.premium + fee);
+        treasuryUSDC += fee;
+        s.subscriberFee = fee;
         s.status = ShieldStatus.PENDING;
 
         emit ShieldFunded(shieldId, msg.sender);
     }
 
-    // ========== MATCH (partial fill) ==========
+    // ========== MATCH (partial fill) — guardian deposits EURC ==========
 
     function matchShield(uint256 shieldId, address guardian, uint256 amount) external {
         _matchShield(shieldId, guardian, amount);
@@ -156,12 +184,15 @@ contract BulwArc {
         uint256 remaining = s.notional - s.filled;
         require(amount <= remaining, "Exceeds remaining");
 
-        usdc.transferFrom(msg.sender, address(this), amount);
+        // Guardian fee on collateral
+        uint256 fee = amount * feeBps / 10000;
+        eurc.transferFrom(msg.sender, address(this), amount + fee);
+        treasuryEURC += fee;
 
         fills[shieldId].push(Fill({guardian: guardian, amount: amount}));
         s.filled += amount;
 
-        // Distribute premium pro-rata to this guardian
+        // Distribute premium (USDC) pro-rata to guardian
         uint256 premiumShare = s.premium * amount / s.notional;
         if (premiumShare > 0) {
             usdc.transfer(guardian, premiumShare);
@@ -175,6 +206,19 @@ contract BulwArc {
         }
     }
 
+    // ========== VALIDATE ==========
+
+    /// @notice Validator confirms delivery rate (0-100%)
+    function validateDelivery(uint256 shieldId, uint8 rate) external {
+        Shield storage s = shields[shieldId];
+        require(s.validator != address(0), "No validator set");
+        require(msg.sender == s.validator, "Not validator");
+        require(rate <= 100, "Rate must be 0-100");
+        require(s.status == ShieldStatus.PENDING || s.status == ShieldStatus.LOCKED, "Cannot validate");
+
+        s.deliveryRate = rate;
+    }
+
     // ========== EXERCISE ==========
 
     function exercise(uint256 shieldId) external {
@@ -184,31 +228,43 @@ contract BulwArc {
         require(msg.sender == s.subscriber, "Not subscriber");
         require(block.timestamp <= s.expiry, "Past expiry");
 
+        // If a validator is set, deliveryRate must be > 0
+        if (s.validator != address(0)) {
+            require(s.deliveryRate > 0, "Not validated");
+        }
+
         (int256 spot, uint256 updatedAt) = oracle.getPrice();
         require(block.timestamp <= updatedAt + 5 minutes, "Stale oracle price");
         require(spot > 0, "Invalid oracle price");
         require(uint256(spot) < s.strike, "Not in the money");
 
-        uint256 payoffPerUnit = s.strike - uint256(spot);
+        uint256 strikeDiff = s.strike - uint256(spot);
+
+        // Effective delivery rate: 100 if no validator, otherwise deliveryRate
+        uint256 rate = s.validator == address(0) ? 100 : uint256(s.deliveryRate);
 
         s.status = ShieldStatus.EXERCISED;
+
+        // Refund subscriber fee pro-rata (accounts for fill ratio + delivery rate)
+        _refundSubscriberFee(s, rate);
 
         uint256 totalPayoff;
         Fill[] storage f = fills[shieldId];
         for (uint256 i = 0; i < f.length; i++) {
-            uint256 guardianPayoff = payoffPerUnit * f[i].amount / 1e8;
+            // Payoff scaled by deliveryRate
+            uint256 guardianPayoff = strikeDiff * f[i].amount * rate / (s.strike * 100);
             if (guardianPayoff > f[i].amount) guardianPayoff = f[i].amount;
 
             totalPayoff += guardianPayoff;
 
             uint256 guardianRemaining = f[i].amount - guardianPayoff;
             if (guardianRemaining > 0) {
-                usdc.transfer(f[i].guardian, guardianRemaining);
+                eurc.transfer(f[i].guardian, guardianRemaining);
             }
         }
 
         if (totalPayoff > 0) {
-            usdc.transfer(s.subscriber, totalPayoff);
+            eurc.transfer(s.subscriber, totalPayoff);
         }
 
         emit ShieldExercised(shieldId, totalPayoff);
@@ -223,9 +279,12 @@ contract BulwArc {
 
         s.status = ShieldStatus.EXPIRED;
 
+        // On expire, delivery doesn't matter — refund fee based on fill ratio only
+        _refundSubscriberFee(s, 100);
+
         Fill[] storage f = fills[shieldId];
         for (uint256 i = 0; i < f.length; i++) {
-            usdc.transfer(f[i].guardian, f[i].amount);
+            eurc.transfer(f[i].guardian, f[i].amount);
         }
 
         emit ShieldExpired(shieldId);
@@ -242,7 +301,33 @@ contract BulwArc {
         s.status = ShieldStatus.EXPIRED;
 
         if (prev == ShieldStatus.PENDING) {
-            usdc.transfer(s.subscriber, s.premium);
+            // Return premium + full fee (nothing was filled)
+            uint256 refund = s.premium + s.subscriberFee;
+            treasuryUSDC -= s.subscriberFee;
+            s.subscriberFee = 0;
+            usdc.transfer(s.subscriber, refund);
+        }
+    }
+
+    // ========== ADMIN ==========
+
+    function setFeeBps(uint256 _feeBps) external {
+        require(msg.sender == owner, "Not owner");
+        require(_feeBps <= 1000, "Fee too high"); // max 10%
+        feeBps = _feeBps;
+    }
+
+    function withdrawTreasury(address to) external {
+        require(msg.sender == owner, "Not owner");
+        if (treasuryUSDC > 0) {
+            uint256 amount = treasuryUSDC;
+            treasuryUSDC = 0;
+            usdc.transfer(to, amount);
+        }
+        if (treasuryEURC > 0) {
+            uint256 amount = treasuryEURC;
+            treasuryEURC = 0;
+            eurc.transfer(to, amount);
         }
     }
 
@@ -262,5 +347,20 @@ contract BulwArc {
 
     function getFillCount(uint256 shieldId) external view returns (uint256) {
         return fills[shieldId].length;
+    }
+
+    // ========== INTERNAL ==========
+
+    /// @dev Refund subscriber fee pro-rata based on fill ratio and delivery rate
+    /// usedFee = subscriberFee * (filled / notional) * (rate / 100)
+    function _refundSubscriberFee(Shield storage s, uint256 rate) internal {
+        if (s.subscriberFee == 0) return;
+
+        uint256 usedFee = s.subscriberFee * s.filled * rate / (s.notional * 100);
+        uint256 refund = s.subscriberFee - usedFee;
+        if (refund > 0) {
+            treasuryUSDC -= refund;
+            usdc.transfer(s.subscriber, refund);
+        }
     }
 }
