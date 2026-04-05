@@ -223,45 +223,60 @@ if [ "$MODE" = "hit" ]; then
     --rpc-url "$RPC" --private-key "$PK_DEPLOYER" --json | jq -r '.transactionHash'
   echo ""
 
-  echo "=== [7] Subscriber exercises ==="
-  TX=$(cast send "$BULWARC" "exercise(uint256)" "$SHIELD_ID" \
-    --rpc-url "$RPC" --private-key "$PK_SUBSCRIBER" --json)
+  echo "=== [6b] Waiting for expiry... ==="
+  REMAINING=$((EXPIRY - $(date +%s) + 2))
+  if [ $REMAINING -gt 0 ]; then
+    echo "  Sleeping $REMAINING seconds..."
+    sleep $REMAINING
+  fi
+  echo ""
+
+  echo "=== [7] Settle shield (in the money → swap) ==="
+  TX=$(cast send "$BULWARC" "settle(uint256)" "$SHIELD_ID" \
+    --rpc-url "$RPC" --private-key "$PK_DEPLOYER" --json)
   echo "  tx: $(echo "$TX" | jq -r '.transactionHash')"
   echo "  https://testnet.arcscan.app/tx/$(echo "$TX" | jq -r '.transactionHash')"
   echo ""
 
-  # Expected:
-  # strikeDiff = 96000000 - 92000000 = 4000000
-  # payoff = 4000000 * 600000 * 50 / (92000000 * 100) = 13043
-  PAYOFF=$((4000000 * GUARDIAN_AMOUNT * DELIVERY_RATE / (STRIKE * 100)))
-  GUARDIAN_RETURN=$((GUARDIAN_AMOUNT - PAYOFF))
+  # Expected (settle in the money = swap):
+  # collateralToWorker = GUARDIAN_AMOUNT * DELIVERY_RATE / 100
+  COLLATERAL_TO_SUB=$((GUARDIAN_AMOUNT * DELIVERY_RATE / 100))
+  COLLATERAL_BACK=$((GUARDIAN_AMOUNT - COLLATERAL_TO_SUB))
 
-  # Fee refund: usedFee = 500 * 600000 * 50 / (1000000 * 100) = 150
+  # Guardian gets salary pro-rata: NOTIONAL * GUARDIAN_AMOUNT / filled
+  # filled = GUARDIAN_AMOUNT (only one guardian)
+  SALARY_TO_GUARDIAN=$NOTIONAL
+
+  # Fee refund: usedFee = SUB_FEE * filled * rate / (notional * 100)
   USED_FEE=$((SUB_FEE * GUARDIAN_AMOUNT * DELIVERY_RATE / (NOTIONAL * 100)))
   FEE_REFUND=$((SUB_FEE - USED_FEE))
 
   echo "=== [8] Verify balances ==="
 
-  # Subscriber gets USDC payoff (collateral token in reverse = USDC)
+  # Subscriber gets USDC collateral (collateral token in reverse = USDC)
   S_USDC_F=$(bal_usdc "$ADDR_SUBSCRIBER")
-  S_USDC_F_EXP=$((S_USDC_0 + PAYOFF))
-  check_approx "Subscriber USDC (payoff=$PAYOFF)" "$S_USDC_F" "$S_USDC_F_EXP"
+  S_USDC_F_EXP=$((S_USDC_0 + COLLATERAL_TO_SUB))
+  check_approx "Subscriber USDC (collateral=$COLLATERAL_TO_SUB)" "$S_USDC_F" "$S_USDC_F_EXP"
 
-  # Subscriber gets EURC fee refund (premium token in reverse = EURC)
+  # Subscriber gets EURC fee refund (salary token in reverse = EURC)
   S_EURC_F=$(bal_eurc "$ADDR_SUBSCRIBER")
   S_EURC_F_EXP=$((S_EURC_0 + FEE_REFUND))
   check "Subscriber EURC (fee refund=$FEE_REFUND)" "$S_EURC_F" "$S_EURC_F_EXP"
 
-  # Guardian gets remaining USDC collateral back
+  # Guardian gets back undelivered USDC collateral
   G_USDC_F=$(bal_usdc "$ADDR_GUARDIAN")
-  G_USDC_F_EXP=$((G_USDC_4 + GUARDIAN_RETURN))
-  check_approx "Guardian USDC (return=$GUARDIAN_RETURN)" "$G_USDC_F" "$G_USDC_F_EXP"
+  G_USDC_F_EXP=$((G_USDC_4 + COLLATERAL_BACK))
+  check_approx "Guardian USDC (back=$COLLATERAL_BACK)" "$G_USDC_F" "$G_USDC_F_EXP"
+
+  # Guardian gets EURC salary
+  G_EURC_F=$(bal_eurc "$ADDR_GUARDIAN")
+  G_EURC_F_EXP=$((G_EURC_4 + SALARY_TO_GUARDIAN))
+  check "Guardian EURC (salary=$SALARY_TO_GUARDIAN)" "$G_EURC_F" "$G_EURC_F_EXP"
 
   echo ""
-  echo "  Summary (REVERSE — EUR weakened):"
-  echo "  Subscriber (US traveller) gets $PAYOFF USDC payoff"
-  echo "  Guardian (EU worker) keeps EURC premium + gets $GUARDIAN_RETURN USDC back"
-  echo "  Fee refund: $FEE_REFUND EURC to subscriber"
+  echo "  Summary (REVERSE — EUR weakened → swap):"
+  echo "  Subscriber gets $COLLATERAL_TO_SUB USDC collateral + $FEE_REFUND EURC fee refund"
+  echo "  Guardian gets $SALARY_TO_GUARDIAN EURC salary + $COLLATERAL_BACK USDC back + kept $PREMIUM_SHARE EURC premium"
 
 else
   echo "=== [6] Waiting for expiry... ==="
@@ -272,8 +287,8 @@ else
   fi
   echo ""
 
-  echo "=== [7] Expire shield ==="
-  TX=$(cast send "$BULWARC" "expire(uint256)" "$SHIELD_ID" \
+  echo "=== [7] Settle shield (out of money → refund) ==="
+  TX=$(cast send "$BULWARC" "settle(uint256)" "$SHIELD_ID" \
     --rpc-url "$RPC" --private-key "$PK_DEPLOYER" --json)
   echo "  tx: $(echo "$TX" | jq -r '.transactionHash')"
   echo "  https://testnet.arcscan.app/tx/$(echo "$TX" | jq -r '.transactionHash')"
@@ -285,14 +300,14 @@ else
 
   echo "=== [8] Verify balances ==="
 
-  # Subscriber: no USDC payoff
+  # Subscriber: no USDC collateral
   S_USDC_F=$(bal_usdc "$ADDR_SUBSCRIBER")
   check_approx "Subscriber USDC unchanged" "$S_USDC_F" "$S_USDC_0"
 
-  # Subscriber gets EURC fee refund (partial fill)
+  # Subscriber gets EURC salary back + fee refund
   S_EURC_F=$(bal_eurc "$ADDR_SUBSCRIBER")
-  S_EURC_F_EXP=$((S_EURC_0 + FEE_REFUND))
-  check "Subscriber EURC (fee refund=$FEE_REFUND)" "$S_EURC_F" "$S_EURC_F_EXP"
+  S_EURC_F_EXP=$((S_EURC_0 + NOTIONAL + FEE_REFUND))
+  check "Subscriber EURC (salary+refund=$((NOTIONAL + FEE_REFUND)))" "$S_EURC_F" "$S_EURC_F_EXP"
 
   # Guardian gets full USDC collateral back
   G_USDC_F=$(bal_usdc "$ADDR_GUARDIAN")
@@ -300,10 +315,9 @@ else
   check_approx "Guardian USDC (full collateral back)" "$G_USDC_F" "$G_USDC_F_EXP"
 
   echo ""
-  echo "  Summary (REVERSE — EUR stable):"
-  echo "  Strike not reached → shield expired"
-  echo "  Guardian keeps EURC premium ($PREMIUM_SHARE) + gets USDC collateral back"
-  echo "  Fee refund: $FEE_REFUND EURC to subscriber (40% unfilled)"
+  echo "  Summary (REVERSE — EUR stable → refund):"
+  echo "  Subscriber gets $NOTIONAL EURC salary back + $FEE_REFUND EURC fee refund"
+  echo "  Guardian gets $GUARDIAN_AMOUNT USDC collateral back + kept $PREMIUM_SHARE EURC premium"
 fi
 
 echo ""
